@@ -73,3 +73,8 @@ def check_license():
         "reason": "valid",
         "expires_at": lic["expires_at"].isoformat() if lic["expires_at"] else None
     })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

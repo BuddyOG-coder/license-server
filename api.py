@@ -20,6 +20,14 @@ def bad_secret():
     return request.headers.get("X-App-Secret") != APP_SECRET
 
 
+def ensure_license_columns():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS online BOOLEAN NOT NULL DEFAULT FALSE;")
+        conn.commit()
+
+
 def check_license_common(key, hwid):
     now = datetime.now(timezone.utc)
 
@@ -61,12 +69,36 @@ def check_license_common(key, hwid):
     return True, "valid", lic
 
 
-def ensure_online_columns():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;")
-            cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS online BOOLEAN NOT NULL DEFAULT FALSE;")
-        conn.commit()
+def serialize_license(row):
+    if not row:
+        return None
+
+    now = datetime.now(timezone.utc)
+    expires_at = row.get("expires_at")
+    seconds_left = None
+    expired = False
+
+    if expires_at:
+        seconds_left = int((expires_at - now).total_seconds())
+        expired = seconds_left <= 0
+        if seconds_left < 0:
+            seconds_left = 0
+
+    return {
+        "license_key": row.get("license_key"),
+        "active": row.get("active"),
+        "banned": row.get("banned"),
+        "online": row.get("online"),
+        "hwid": row.get("hwid"),
+        "pc_locked": bool(row.get("hwid")),
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "seconds_left": seconds_left,
+        "expired": expired,
+        "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        "last_check_at": row.get("last_check_at").isoformat() if row.get("last_check_at") else None,
+        "last_seen_at": row.get("last_seen_at").isoformat() if row.get("last_seen_at") else None,
+        "note": row.get("note"),
+    }
 
 
 @app.post("/check")
@@ -77,7 +109,7 @@ def check_license():
     if bad_secret():
         return jsonify({"ok": False, "reason": "bad_secret"}), 401
 
-    ensure_online_columns()
+    ensure_license_columns()
 
     data = request.get_json(silent=True) or {}
     key = str(data.get("key", "")).strip()
@@ -94,7 +126,68 @@ def check_license():
     return jsonify({
         "ok": True,
         "reason": "valid",
+        "license": serialize_license(lic),
         "expires_at": lic["expires_at"].isoformat() if lic and lic["expires_at"] else None
+    })
+
+
+@app.post("/status")
+def license_status():
+    if not APP_SECRET:
+        return jsonify({"ok": False, "reason": "server_missing_secret"}), 500
+
+    if bad_secret():
+        return jsonify({"ok": False, "reason": "bad_secret"}), 401
+
+    ensure_license_columns()
+
+    data = request.get_json(silent=True) or {}
+    key = str(data.get("key", "")).strip()
+    hwid = str(data.get("hwid", "")).strip()
+
+    if not key or not hwid:
+        return jsonify({"ok": False, "reason": "missing_key_or_hwid"}), 400
+
+    now = datetime.now(timezone.utc)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM licenses WHERE license_key = %s;", (key,))
+            lic = cur.fetchone()
+
+            if not lic:
+                return jsonify({"ok": False, "reason": "invalid_key"}), 403
+
+            if lic["hwid"] and lic["hwid"] != hwid:
+                return jsonify({"ok": False, "reason": "hwid_mismatch"}), 403
+
+            if lic["expires_at"] and lic["expires_at"] < now:
+                return jsonify({
+                    "ok": False,
+                    "reason": "expired",
+                    "license": serialize_license(lic)
+                }), 403
+
+            if lic["banned"]:
+                return jsonify({
+                    "ok": False,
+                    "reason": "banned",
+                    "license": serialize_license(lic)
+                }), 403
+
+            if not lic["active"]:
+                return jsonify({
+                    "ok": False,
+                    "reason": "inactive",
+                    "license": serialize_license(lic)
+                }), 403
+
+        conn.commit()
+
+    return jsonify({
+        "ok": True,
+        "reason": "status_ok",
+        "license": serialize_license(lic)
     })
 
 
@@ -106,7 +199,7 @@ def heartbeat():
     if bad_secret():
         return jsonify({"ok": False, "reason": "bad_secret"}), 401
 
-    ensure_online_columns()
+    ensure_license_columns()
 
     data = request.get_json(silent=True) or {}
     key = str(data.get("key", "")).strip()
@@ -131,7 +224,7 @@ def logout():
     if bad_secret():
         return jsonify({"ok": False, "reason": "bad_secret"}), 401
 
-    ensure_online_columns()
+    ensure_license_columns()
 
     data = request.get_json(silent=True) or {}
     key = str(data.get("key", "")).strip()
@@ -160,7 +253,7 @@ def online_users():
     if bad_secret():
         return jsonify({"ok": False, "reason": "bad_secret"}), 401
 
-    ensure_online_columns()
+    ensure_license_columns()
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
 
